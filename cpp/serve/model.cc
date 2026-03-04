@@ -773,6 +773,30 @@ class ModelImpl : public ModelObj {
       local_kv_cache_ = ft_.use_disco
                             ? Downcast<DRef>(kv_cache_)->DebugGetFromRemote(0).cast<ObjectRef>()
                             : kv_cache_;
+    } else if (kv_state_kind == KVStateKind::kHybrid) {
+      // Create PagedKVCache for full attention layers
+      IntTuple max_num_sequence_tuple{max_num_sequence};
+      IntTuple max_total_sequence_length_tuple{max_total_sequence_length};
+      IntTuple prefill_chunk_size_tuple{prefill_chunk_size};
+      IntTuple page_size_tuple{page_size};
+      IntTuple support_sliding_window{sliding_window_size_ != -1};
+      ObjectRef paged_kv_cache =
+          ft_.create_kv_cache_func_(max_num_sequence_tuple, max_total_sequence_length_tuple,
+                                    prefill_chunk_size_tuple, page_size_tuple,
+                                    support_sliding_window)
+              .cast<ObjectRef>();
+      // Create RNNState for linear attention layers
+      IntTuple max_history_size_tuple = {std::max(max_history_size, 1)};
+      ObjectRef rnn_state =
+          ft_.create_rnn_state_func_(max_num_sequence_tuple, max_history_size_tuple)
+              .cast<ObjectRef>();
+      // Wrap both in a HybridState
+      static Function f_create_hybrid =
+          Function::GetGlobalRequired("vm.builtin.hybrid_state_create");
+      kv_cache_ = f_create_hybrid(paged_kv_cache, rnn_state).cast<ObjectRef>();
+      local_kv_cache_ = ft_.use_disco
+                            ? Downcast<DRef>(kv_cache_)->DebugGetFromRemote(0).cast<ObjectRef>()
+                            : kv_cache_;
     } else if (kv_state_kind == KVStateKind::kNone) {
       // Do nothing
     } else {

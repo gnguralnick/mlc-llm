@@ -235,13 +235,17 @@ void FunctionTable::_InitFunctions() {
       mod->GetFunction("apply_bitmask_inplace", true).value_or(Function(nullptr));
   this->alloc_embedding_tensor_func_ = mod_get_func("alloc_embedding_tensor");
   this->cuda_graph_alloc_init_func_ = mod_get_func("cuda_graph_alloc_init");
+  // Check for RNN state creation (hybrid or pure RNN models)
+  this->create_rnn_state_func_ = mod_get_func("create_rnn_state");
+  // Find the KV cache creation function (standard chain)
   this->create_kv_cache_func_ = mod_get_func("create_flashinfer_paged_kv_cache");
   if (this->model_metadata_.sliding_window_size != -1 || !this->create_kv_cache_func_.defined()) {
-    Function f_create_rnn_state = mod_get_func("create_rnn_state");
-    if (f_create_rnn_state.defined()) {
-      this->create_kv_cache_func_ = f_create_rnn_state;
-    } else {
-      this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
+    Function f_tir = mod_get_func("create_tir_paged_kv_cache");
+    if (f_tir.defined()) {
+      this->create_kv_cache_func_ = f_tir;
+    } else if (this->create_rnn_state_func_.defined()) {
+      // Pure RNN model: use rnn_state as the kv cache func
+      this->create_kv_cache_func_ = this->create_rnn_state_func_;
     }
   }
   this->reset_kv_cache_func_ = get_global_func("vm.builtin.kv_state_clear");

@@ -43,6 +43,7 @@ from .qwen import qwen_loader, qwen_model
 from .qwen2 import qwen2_loader, qwen2_model
 from .qwen2_moe import qwen2_moe_loader, qwen2_moe_model
 from .qwen3 import qwen3_loader, qwen3_model
+from .qwen3_5 import qwen3_5_loader, qwen3_5_model
 from .qwen3_moe import qwen3_moe_loader, qwen3_moe_model
 from .rwkv5 import rwkv5_loader, rwkv5_model
 from .rwkv6 import rwkv6_loader, rwkv6_model
@@ -370,6 +371,18 @@ MODELS: Dict[str, Model] = {
         quantize=make_quantization_functions(
             qwen3_model.Qwen3EmbeddingModel,
             supports_block_scale=True,
+        ),
+    ),
+    "qwen3_5": Model(
+        name="qwen3_5",
+        model=qwen3_5_model.Qwen35LMHeadModel,
+        config=qwen3_5_model.Qwen35Config,
+        source={
+            "huggingface-torch": qwen3_5_loader.huggingface,
+            "huggingface-safetensor": qwen3_5_loader.huggingface,
+        },
+        quantize=make_quantization_functions(
+            qwen3_5_model.Qwen35LMHeadModel,
         ),
     ),
     "qwen3_moe": Model(
