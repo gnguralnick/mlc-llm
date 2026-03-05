@@ -549,6 +549,14 @@ class Qwen35GatedAttention(nn.Module):
         # Fuse QKV for PagedKVCache attention (partial RoPE handled by rotary_dim param)
         qkv = op.concat([q, k, v], dim=2)  # (B, S, h_q + 2*h_kv, d)
 
+        # TODO(M-RoPE): PagedKVCache currently applies 1D RoPE to all tokens. For full
+        # M-RoPE support, image tokens need 3D position IDs (t, h, w) where each dimension
+        # gets its own slice of head_dim for rotary encoding. This requires:
+        # 1. Passing per-token 3D position IDs from image_embed through the prefill call
+        # 2. Modifying PagedKVCache (or using a custom RoPE application before caching) to
+        #    apply separate rotary embeddings per dimension instead of sequential 1D positions
+        # 3. During decode, all three dimensions increment equally so no special handling needed
+        # Only the 8 full-attention layers are affected; DeltaNet layers have no position encoding.
         attn_output = state.attention_with_fused_qkv(
             self.kv_layer_id,
             qkv,
@@ -673,6 +681,16 @@ class Qwen35Model(nn.Module):
 
     def forward(self, inputs: Tensor, state: HybridState):
         hidden_states = inputs
+        # TODO(DeepStack): HF's Qwen3.5 supports injecting vision features at intermediate
+        # layers specified by vision_config.deepstack_visual_indexes. Currently disabled in
+        # released models (deepstack_visual_indexes=[]):
+        #   https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json
+        #   https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/config.json
+        # If enabled, this loop would need to:
+        # 1. Accept vision_embeds and image_token_mask as additional arguments
+        # 2. At each layer index in deepstack_visual_indexes, replace the hidden states at
+        #    image token positions with a projection of the vision encoder output for that layer
+        # 3. Each DeepStack injection layer would have its own projection (Linear → GELU → Linear)
         for layer in self.layers:
             hidden_states, state = layer(hidden_states, state)
         hidden_states = self.norm(hidden_states)

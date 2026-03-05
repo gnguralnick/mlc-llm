@@ -27,6 +27,7 @@ from . import (
     phi,
     qwen2,
     qwen3_5,
+    qwen3_5_v,
     redpajama,
     rwkv,
     stablelm,

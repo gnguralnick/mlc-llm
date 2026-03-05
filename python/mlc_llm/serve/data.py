@@ -156,6 +156,10 @@ class ImageData(Data):
             # fixed to 256 per image
             return 256
 
+        if model_type == "qwen3_5_v":
+            # (image_size / patch_size / spatial_merge_size)^2 = (448/16/2)^2 = 196
+            return 196
+
         # Default: (image_size / patch_size)^2
         return ImageData.get_embed_size(config)
 
