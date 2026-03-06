@@ -125,6 +125,10 @@ Number of pipeline stages to split the model layers for pipeline parallelism.
     """disaggregation""": """
 Whether enable disaggregation when compiling the model.
 """.strip(),
+    "max_dynamic_patch": """
+Maximum number of dynamic patches for vision models (e.g. InternVL). Lower values reduce
+image tokens and TTFT at the cost of image detail. Use 1 for single-tile mode.
+""".strip(),
     "overrides": """
 Model configuration override. Configurations to override `mlc-chat-config.json`. Supports
 `context_window_size`, `prefill_chunk_size`, `sliding_window_size`, `attention_sink_size`,

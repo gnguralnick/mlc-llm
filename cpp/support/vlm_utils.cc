@@ -10,7 +10,7 @@ namespace mlc {
 namespace llm {
 
 void CalculateResizeShape(tvm::runtime::Tensor image_data, std::string model_type,
-                          int* p_target_height, int* p_target_width) {
+                          int* p_target_height, int* p_target_width, int max_tiles) {
   TVM_FFI_ICHECK_EQ(image_data->shape[3], 3) << "Image format must be NHWC";
   int height = image_data->shape[1];
   int width = image_data->shape[2];
@@ -28,11 +28,39 @@ void CalculateResizeShape(tvm::runtime::Tensor image_data, std::string model_typ
   } else if ("gemma3_v" == model_type) {
     *p_target_height = 896;
     *p_target_width = 896;
+  } else if ("internvl_chat" == model_type) {
+    // Matches HF dynamic_preprocess: find (i, j) where i=width_tiles, j=height_tiles,
+    // i*j <= max_tiles, and i/j closest to width/height aspect ratio.
+    const int image_size = 448;
+    double aspect = static_cast<double>(width) / height;
+    double area = static_cast<double>(width) * height;
+
+    int best_i = 1, best_j = 1;
+    double best_diff = 1e9;
+    for (int i = 1; i <= max_tiles; ++i) {
+      for (int j = 1; j <= max_tiles; ++j) {
+        if (i * j > max_tiles) continue;
+        double target_aspect = static_cast<double>(i) / j;
+        double diff = std::abs(target_aspect - aspect);
+        if (diff < best_diff) {
+          best_diff = diff;
+          best_i = i;
+          best_j = j;
+        } else if (diff == best_diff) {
+          if (area > 0.5 * image_size * image_size * i * j) {
+            best_i = i;
+            best_j = j;
+          }
+        }
+      }
+    }
+    *p_target_width = best_i * image_size;
+    *p_target_height = best_j * image_size;
   }
 }
 
 void CalculatePadShape(tvm::runtime::Tensor image_data, std::string model_type, int* p_pad_height,
-                       int* p_pad_width) {
+                       int* p_pad_width, int max_tiles) {
   TVM_FFI_ICHECK_EQ(image_data->shape[3], 3) << "Image format must be NHWC";
   if ("phi3_v" == model_type) {
     int resized_height = 0, resized_width = 0;
@@ -51,7 +79,7 @@ void CalculatePadShape(tvm::runtime::Tensor image_data, std::string model_type, 
 }
 
 void CalculateCropShape(tvm::runtime::Tensor image_data, std::string model_type, int* p_crop_height,
-                        int* p_crop_width) {
+                        int* p_crop_width, int max_tiles) {
   TVM_FFI_ICHECK_EQ(image_data->shape[3], 3) << "Image format must be NHWC";
   if ("phi3_v" == model_type) {
     int pad_h = 0, pad_w = 0;
@@ -61,6 +89,11 @@ void CalculateCropShape(tvm::runtime::Tensor image_data, std::string model_type,
   } else if ("gemma3_v" == model_type) {
     *p_crop_height = 1;
     *p_crop_width = 1;
+  } else if ("internvl_chat" == model_type) {
+    int resize_h = 0, resize_w = 0;
+    CalculateResizeShape(image_data, model_type, &resize_h, &resize_w, max_tiles);
+    *p_crop_height = resize_h / 448;
+    *p_crop_width = resize_w / 448;
   }
 }
 

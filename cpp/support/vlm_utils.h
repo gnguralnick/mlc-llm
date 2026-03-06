@@ -21,7 +21,7 @@ namespace llm {
  * the variable where the calculated target width will be stored.
  */
 void CalculateResizeShape(tvm::runtime::Tensor image_data, std::string model_type,
-                          int* p_target_height, int* p_target_width);
+                          int* p_target_height, int* p_target_width, int max_tiles = 12);
 /*!
  * \brief Calculate the padding height and width for an image based on the input data and model
  * type. \param image_data The input image data as a TVM Tensor. \param model_type The type of the
@@ -30,7 +30,7 @@ void CalculateResizeShape(tvm::runtime::Tensor image_data, std::string model_typ
  * variable where the calculated padding width will be stored.
  */
 void CalculatePadShape(tvm::runtime::Tensor image_data, std::string model_type, int* p_pad_height,
-                       int* p_pad_width);
+                       int* p_pad_width, int max_tiles = 12);
 
 /*!
  * \brief Calculate the cropping height and width for an image based on the input data and model
@@ -40,7 +40,7 @@ void CalculatePadShape(tvm::runtime::Tensor image_data, std::string model_type, 
  * variable where the calculated cropping width will be stored.
  */
 void CalculateCropShape(tvm::runtime::Tensor image_data, std::string model_type, int* p_crop_height,
-                        int* p_crop_width);
+                        int* p_crop_width, int max_tiles = 12);
 
 }  // namespace llm
 }  // namespace mlc

@@ -129,11 +129,11 @@ class ModelImpl : public ModelObj {
         << "`image_embed` function is not found in the model. ";
 
     int tmp_h = 0, tmp_w = 0;
-    CalculateResizeShape(image, this->model_type_, &tmp_h, &tmp_w);
+    CalculateResizeShape(image, this->model_type_, &tmp_h, &tmp_w, this->max_dynamic_patch_);
     Shape resize_h = {tmp_h};
     Shape resize_w = {tmp_w};
 
-    CalculateCropShape(image, this->model_type_, &tmp_h, &tmp_w);
+    CalculateCropShape(image, this->model_type_, &tmp_h, &tmp_w, this->max_dynamic_patch_);
     Shape crop_h = {tmp_h};
     Shape crop_w = {tmp_w};
 
@@ -1077,6 +1077,12 @@ class ModelImpl : public ModelObj {
     this->attention_sink_size_ = std::max(this->attention_sink_size_, 0);
     this->vocab_size_ = json::Lookup<int64_t>(config, "vocab_size");
     this->model_type_ = json::Lookup<std::string>(config, "model_type");
+    // Read max_dynamic_patch from nested model_config if present
+    auto model_cfg_opt = json::LookupOptional<tvm::ffi::json::Object>(config, "model_config");
+    if (model_cfg_opt.has_value()) {
+      this->max_dynamic_patch_ =
+          json::LookupOrDefault<int64_t>(*model_cfg_opt, "max_dynamic_patch", this->max_dynamic_patch_);
+    }
   }
 
   //----------------------------
@@ -1095,6 +1101,7 @@ class ModelImpl : public ModelObj {
   int image_embed_size_ = -1;
   int seqlen_padding_factor_ = 1;
   std::string model_type_;
+  int max_dynamic_patch_ = 12;
   //----------------------------
   // TVM related states
   //----------------------------

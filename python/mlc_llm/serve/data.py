@@ -156,6 +156,37 @@ class ImageData(Data):
             # fixed to 256 per image
             return 256
 
+        if model_type == "internvl_chat":
+            # Matches HF dynamic_preprocess: find (i, j) where i=width_tiles,
+            # j=height_tiles, i*j <= max_tiles, i/j closest to width/height.
+            image_size = 448
+            max_tiles = config.get("model_config", {}).get("max_dynamic_patch", 12)
+            aspect = width / height
+            area = width * height
+
+            best_i, best_j = 1, 1
+            best_diff = float("inf")
+            for i in range(1, max_tiles + 1):
+                for j in range(1, max_tiles + 1):
+                    if i * j > max_tiles:
+                        continue
+                    target_aspect = i / j
+                    diff = abs(target_aspect - aspect)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_i = i
+                        best_j = j
+                    elif diff == best_diff:
+                        if area > 0.5 * image_size * image_size * i * j:
+                            best_i = i
+                            best_j = j
+            num_tiles = best_i * best_j
+            # Include thumbnail only when max_dynamic_patch > 1 (with max_dynamic_patch=1,
+            # thumbnail is identical to the single tile so compiled model skips it)
+            if max_tiles > 1:
+                num_tiles += 1
+            return num_tiles * 256
+
         # Default: (image_size / patch_size)^2
         return ImageData.get_embed_size(config)
 

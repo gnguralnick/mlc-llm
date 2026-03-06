@@ -25,6 +25,7 @@ from .gpt_j import gpt_j_loader, gpt_j_model
 from .gpt_neox import gpt_neox_loader, gpt_neox_model
 from .internlm import internlm_loader, internlm_model
 from .internlm2 import internlm2_loader, internlm2_model
+from .internvl import internvl_loader, internvl_model
 from .llama import llama_loader, llama_model
 from .llama4 import llama4_loader, llama4_model
 from .llava import llava_loader, llava_model
@@ -456,6 +457,19 @@ MODELS: Dict[str, Model] = {
         },
         quantize=make_quantization_functions(
             internlm2_model.InternLM2ForCausalLM,
+        ),
+    ),
+    "internvl_chat": Model(
+        name="internvl_chat",
+        model=internvl_model.InternVLForCausalLM,
+        config=internvl_model.InternVLConfig,
+        source={
+            "huggingface-torch": internvl_loader.huggingface,
+            "huggingface-safetensor": internvl_loader.huggingface,
+        },
+        quantize=make_quantization_functions(
+            internvl_model.InternVLForCausalLM,
+            supports_ft_quant=False,
         ),
     ),
     "rwkv5": Model(

@@ -98,6 +98,7 @@ def gen_config(  # pylint: disable=too-many-locals,too-many-arguments,too-many-b
     tensor_parallel_shards: Optional[int],
     pipeline_parallel_stages: Optional[int],
     disaggregation: Optional[bool],
+    max_dynamic_patch: Optional[int],
     max_batch_size: int,
     output: Path,
 ):
@@ -123,6 +124,7 @@ def gen_config(  # pylint: disable=too-many-locals,too-many-arguments,too-many-b
         tensor_parallel_shards=tensor_parallel_shards,
         pipeline_parallel_stages=pipeline_parallel_stages,
         disaggregation=disaggregation,
+        max_dynamic_patch=max_dynamic_patch,
     ).apply(model.config.from_file(config))
     mlc_chat_config = MLCChatConfig(
         model_type=model.name,
@@ -348,4 +350,5 @@ CONV_TEMPLATES = {
     "olmo",
     "nemotron",
     "llm-jp",
+    "internvl2_5",
 }

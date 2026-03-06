@@ -14,6 +14,7 @@ from . import (
     gorilla,
     gpt,
     hermes,
+    internvl,
     llama,
     llava,
     llm_jp,

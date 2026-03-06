@@ -244,6 +244,16 @@ class ImageProcessor(Module):
             o_dtype=o_dtype,
         )
 
+    def normalize_imagenet(self, image: Tensor, o_dtype="float32"):
+        """Normalize with ImageNet values: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]"""
+        return self._normalize_impl(
+            image,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+            name="normalize_imagenet",
+            o_dtype=o_dtype,
+        )
+
     def normalize_siglip(self, image: Tensor, o_dtype="float32"):
         """Normalize with SigLIP values: mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]"""
         return self._normalize_impl(

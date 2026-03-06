@@ -149,6 +149,7 @@ class ModelConfigOverride(ConfigOverrideBase):  # pylint: disable=too-many-insta
     tensor_parallel_shards: Optional[int] = None
     pipeline_parallel_stages: Optional[int] = None
     disaggregation: Optional[bool] = None
+    max_dynamic_patch: Optional[int] = None
 
     def __repr__(self) -> str:
         out = StringIO()
@@ -164,6 +165,7 @@ class ModelConfigOverride(ConfigOverrideBase):  # pylint: disable=too-many-insta
             end="",
         )
         print(f";disaggregation={self.disaggregation}", file=out, end="")
+        print(f";max_dynamic_patch={self.max_dynamic_patch}", file=out, end="")
         return out.getvalue().rstrip()
 
     @staticmethod
@@ -182,6 +184,7 @@ class ModelConfigOverride(ConfigOverrideBase):  # pylint: disable=too-many-insta
             type=lambda x: str(x).lower() in ["true", "1", "yes", "True"],
             default=None,
         )
+        parser.add_argument("--max_dynamic_patch", type=int, default=None)
         results = parser.parse_args([f"--{i}" for i in source.split(";") if i])
         return ModelConfigOverride(
             context_window_size=results.context_window_size,
@@ -192,6 +195,7 @@ class ModelConfigOverride(ConfigOverrideBase):  # pylint: disable=too-many-insta
             tensor_parallel_shards=results.tensor_parallel_shards,
             pipeline_parallel_stages=results.pipeline_parallel_stages,
             disaggregation=results.disaggregation,
+            max_dynamic_patch=results.max_dynamic_patch,
         )
 
 
