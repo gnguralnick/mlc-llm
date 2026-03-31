@@ -160,69 +160,7 @@ def last_token(x: Tensor):
 
 
 # --------------------------------------------------------------------------
-# Fused L2-norm + GQA repeat TIR kernel
-# --------------------------------------------------------------------------
-
-
-def create_l2_norm_repeat_func(
-    num_heads_in: int,
-    num_heads_out: int,
-    head_dim: int,
-    eps: float = 1e-6,
-):
-    """Create a TIR function that L2-normalizes along head_dim and repeats heads.
-
-    Input:  (batch, seq_len, num_heads_in, head_dim)
-    Output: (batch, seq_len, num_heads_out, head_dim)
-
-    Each output head ``h_out`` reads from input head ``h_out // repeat_factor``
-    where ``repeat_factor = num_heads_out // num_heads_in``.
-    """
-    repeat_factor = num_heads_out // num_heads_in
-
-    @T.prim_func
-    def l2_norm_repeat_func(
-        var_x: T.handle,
-        var_out: T.handle,
-    ):
-        T.func_attr({"op_pattern": 8, "tir.noalias": True, "tir.is_scheduled": 1})
-        batch_size, seq_len = T.int64(), T.int64()
-        x_buf = T.match_buffer(
-            var_x, (batch_size, seq_len, num_heads_in, head_dim), dtype="float32"
-        )
-        out_buf = T.match_buffer(
-            var_out, (batch_size, seq_len, num_heads_out, head_dim), dtype="float32"
-        )
-
-        for b in T.thread_binding(batch_size, thread="blockIdx.y"):
-            for h_out in T.thread_binding(num_heads_out, thread="blockIdx.x"):
-                for d in T.thread_binding(head_dim, thread="threadIdx.x"):
-                    for t in range(seq_len):
-                        with T.sblock("l2_norm_repeat"):
-                            vb = T.axis.spatial(batch_size, b)
-                            vt = T.axis.opaque(seq_len, t)
-                            vh = T.axis.spatial(num_heads_out, h_out)
-                            vd = T.axis.spatial(head_dim, d)
-
-                            # Map output head to input head for GQA repeat
-                            # Compute L2 norm for this (batch, time, input_head)
-                            # Use out_buf as scratch (same pattern as deltanet kernel)
-                            out_buf[vb, vt, vh, vd] = T.float32(0)
-                            for i in range(head_dim):
-                                out_buf[vb, vt, vh, vd] += (
-                                    x_buf[vb, vt, vh // repeat_factor, i]
-                                    * x_buf[vb, vt, vh // repeat_factor, i]
-                                )
-                            out_buf[vb, vt, vh, vd] = (
-                                x_buf[vb, vt, vh // repeat_factor, vd]
-                                * T.rsqrt(out_buf[vb, vt, vh, vd] + T.float32(eps))
-                            )
-
-    return l2_norm_repeat_func
-
-
-# --------------------------------------------------------------------------
-# DeltaNet TIR kernel (with fused decay computation)
+# DeltaNet TIR kernel
 # --------------------------------------------------------------------------
 
 
@@ -231,13 +169,7 @@ def create_deltanet_func(
     key_head_dim: int,
     value_head_dim: int,
 ):
-    """Create a TIR function for the recurrent gated delta rule with fused decay.
-
-    The decay is computed inline from raw inputs:
-        g[t,h] = -exp(A_log[h]) * softplus(a_val[t,h] + dt_bias[h])
-    where softplus(x) = log(1 + exp(x)) for x <= 20, else x.
-
-    This eliminates ~1-2 separate dispatch calls per layer for decay computation.
+    """Create a TIR function for the recurrent gated delta rule.
 
     State shape: (batch, num_heads, key_head_dim, value_head_dim)
     Threading: blockIdx.y=batch, blockIdx.x=num_heads, threadIdx.x=value_head_dim
@@ -249,9 +181,7 @@ def create_deltanet_func(
         var_q: T.handle,
         var_k: T.handle,
         var_v: T.handle,
-        var_a: T.handle,
-        var_A_log: T.handle,
-        var_dt_bias: T.handle,
+        var_g: T.handle,
         var_beta: T.handle,
         var_state: T.handle,
         var_out: T.handle,
@@ -268,14 +198,8 @@ def create_deltanet_func(
         v_buf = T.match_buffer(
             var_v, (batch_size, seq_len, num_heads, value_head_dim), dtype="float32"
         )
-        a_buf = T.match_buffer(
-            var_a, (batch_size, seq_len, num_heads), dtype="float32"
-        )
-        A_log_buf = T.match_buffer(
-            var_A_log, (num_heads,), dtype="float32"
-        )
-        dt_bias_buf = T.match_buffer(
-            var_dt_bias, (num_heads,), dtype="float32"
+        g_buf = T.match_buffer(
+            var_g, (batch_size, seq_len, num_heads), dtype="float32"
         )
         beta_buf = T.match_buffer(
             var_beta, (batch_size, seq_len, num_heads), dtype="float32"
@@ -314,25 +238,11 @@ def create_deltanet_func(
                             # scratch space (not local vars) because Metal codegen
                             # silently drops local-variable writes inside T.sblock.
 
-                            # Compute decay inline:
-                            # g = -exp(A_log[h]) * softplus(a[t,h] + dt_bias[h])
-                            a_plus_bias: T.float32 = (
-                                a_buf[vb, vt, vh] + dt_bias_buf[vh]
-                            )
-                            softplus_val: T.float32 = T.if_then_else(
-                                a_plus_bias > T.float32(20),
-                                a_plus_bias,
-                                T.log(T.exp(a_plus_bias) + T.float32(1)),
-                            )
-                            g_val: T.float32 = (
-                                -T.exp(A_log_buf[vh]) * softplus_val
-                            )
-
                             # 1) Decay the state column j by exp(g_t) for all rows
                             for i in range(key_head_dim):
                                 out_state_buf[vb, vh, i, vj] = (
                                     out_state_buf[vb, vh, i, vj]
-                                    * T.exp(g_val)
+                                    * T.exp(g_buf[vb, vt, vh])
                                 )
 
                             # 2) Read: kv_mem_j = sum_i S[i,j] * k_t[i]
@@ -483,36 +393,25 @@ class Qwen35GatedDeltaNet(nn.Module):
         k = op.reshape(k, (b, seq_len, self.num_k_heads, self.head_k_dim))
         v = op.reshape(v, (b, seq_len, self.num_v_heads, self.head_v_dim))
 
-        # Fused L2 normalize + GQA repeat for Q and K
-        # Saves ~4 dispatches per layer (2 for l2_norm each + 1 repeat each)
-        q_f32 = q.astype("float32")
-        k_f32 = k.astype("float32")
+        # L2 normalize Q and K
+        q = l2_norm(q)
+        k = l2_norm(k)
 
-        l2_norm_repeat_kernel = create_l2_norm_repeat_func(
-            num_heads_in=self.num_k_heads,
-            num_heads_out=self.num_v_heads,
-            head_dim=self.head_k_dim,
-        )
-        q_normed = op.tensor_ir_op(
-            l2_norm_repeat_kernel,
-            "l2_norm_repeat_q",
-            [q_f32],
-            [
-                Tensor.placeholder(
-                    [b, seq_len, self.num_v_heads, self.head_k_dim], "float32"
-                ),
-            ],
-        )
-        k_normed = op.tensor_ir_op(
-            l2_norm_repeat_kernel,
-            "l2_norm_repeat_k",
-            [k_f32],
-            [
-                Tensor.placeholder(
-                    [b, seq_len, self.num_v_heads, self.head_k_dim], "float32"
-                ),
-            ],
-        )
+        # GQA expand Q, K from num_k_heads to num_v_heads
+        if self.num_v_heads != self.num_k_heads:
+            repeat_factor = self.num_v_heads // self.num_k_heads
+            q = op.repeat(q, repeat_factor, axis=2)
+            k = op.repeat(k, repeat_factor, axis=2)
+
+        # Compute decay g = -exp(A_log) * softplus(a + dt_bias)
+        # All in float32 — cast from model dtype since params are stored in model dtype
+        a_float = a_val.astype("float32")
+        dt_bias_f32 = self.dt_bias.astype("float32")
+        a_plus_bias = a_float + op.reshape(dt_bias_f32, (1, 1, self.num_v_heads))
+        softplus_val = _stable_softplus(a_plus_bias)
+        neg_A = op.negative(op.exp(self.A_log.astype("float32")))
+        g = op.reshape(neg_A, (1, 1, self.num_v_heads)) * softplus_val
+        # g shape: (B, T, num_v_heads)
 
         # Get recurrent state
         recurrent_state = state.rnn_get(
@@ -522,16 +421,12 @@ class Qwen35GatedDeltaNet(nn.Module):
             "float32",
         )
 
-        # DeltaNet TIR kernel with fused decay computation
+        # DeltaNet TIR kernel
         # Scale Q by 1/sqrt(key_head_dim) as in HF reference
         scale = 1.0 / (self.head_k_dim**0.5)
-        q_scaled = (q_normed * scale).astype("float32")
+        q_f32 = (q * scale).astype("float32")
+        k_f32 = k.astype("float32")
         v_f32 = v.astype("float32")
-
-        # Decay is computed inline from a_val, A_log, dt_bias (saves ~1-2 dispatches)
-        a_f32 = a_val.astype("float32")
-        A_log_f32 = self.A_log.astype("float32")
-        dt_bias_f32 = self.dt_bias.astype("float32")
 
         out, new_recurrent_state = op.tensor_ir_op(
             create_deltanet_func(
@@ -540,16 +435,7 @@ class Qwen35GatedDeltaNet(nn.Module):
                 value_head_dim=self.head_v_dim,
             ),
             "deltanet",
-            [
-                q_scaled,
-                k_normed,
-                v_f32,
-                a_f32,
-                A_log_f32,
-                dt_bias_f32,
-                b_gate.astype("float32"),
-                recurrent_state,
-            ],
+            [q_f32, k_f32, v_f32, g, b_gate.astype("float32"), recurrent_state],
             [
                 Tensor.placeholder(
                     [b, seq_len, self.num_v_heads, self.head_v_dim], "float32"
