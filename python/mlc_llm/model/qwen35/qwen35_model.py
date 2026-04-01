@@ -4,7 +4,6 @@ Implementation for Qwen3.5 GatedDeltaNet hybrid architecture.
 """
 
 import dataclasses
-import math
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -221,25 +220,22 @@ class Qwen35Attention(nn.Module):
 
 
 def create_gated_delta_net_func(
-    num_key_heads: int,
     num_value_heads: int,
     key_head_dim: int,
     value_head_dim: int,
-    dtype: str,
 ):
     """Creates a TIR function for the GatedDeltaNet recurrent computation.
 
     Thread-per-column design: each thread owns one column of the state matrix.
     State S is (key_head_dim x value_head_dim) per head, accumulated in fp32.
 
-    Supports arbitrary sequence length via an inner `for t in range(seq_len)` loop,
-    matching RWKV6's approach. During prefill (seq_len > 1), the recurrence accumulates
-    state across all tokens sequentially. During decode (seq_len = 1), it's a single step.
+    All inputs (Q, K, V, gate/g, beta) are expected in float32. Q should be pre-scaled
+    by 1/sqrt(key_head_dim). The gate input g is the raw log-space decay (not exponentiated);
+    exp(g) is computed inline.
 
-    For GVA (num_value_heads > num_key_heads), Q/K are expanded via repeat.
-    The kernel operates on value_heads (the larger dimension).
+    The per-timestep computation is fused into a single T.sblock("compute") to minimize
+    sync barriers.
     """
-    heads_per_group = num_value_heads // num_key_heads  # 1 for 0.8B, 2 for 4B
     K = key_head_dim  # 128
     V = value_head_dim  # 128
 
@@ -248,31 +244,32 @@ def create_gated_delta_net_func(
         q_handle: T.handle,
         k_handle: T.handle,
         v_handle: T.handle,
-        gate_handle: T.handle,  # exp(g), already exponentiated
-        beta_handle: T.handle,  # sigmoid(beta_raw)
+        g_handle: T.handle,  # raw log-space decay: -exp(A_log) * softplus(alpha + dt_bias)
+        beta_handle: T.handle,  # sigmoid(beta_raw), float32
         state_in_handle: T.handle,
         out_handle: T.handle,
         state_out_handle: T.handle,
     ):
         T.func_attr({"op_pattern": 8, "tirx.noalias": True, "tirx.is_scheduled": 1})
         batch_size, seq_len = T.int64(), T.int64()
-        # q, k: (batch, seq_len, key_heads, K)
-        q_buf = T.match_buffer(q_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
-        k_buf = T.match_buffer(k_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
-        # v: (batch, seq_len, value_heads, V)
-        v_buf = T.match_buffer(v_handle, (batch_size, seq_len, num_value_heads, V), dtype=dtype)
-        # gate and beta: (batch, seq_len, value_heads)
-        gate_buf = T.match_buffer(
-            gate_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        q_buf = T.match_buffer(
+            q_handle, (batch_size, seq_len, num_value_heads, K), dtype="float32"
+        )
+        k_buf = T.match_buffer(
+            k_handle, (batch_size, seq_len, num_value_heads, K), dtype="float32"
+        )
+        v_buf = T.match_buffer(
+            v_handle, (batch_size, seq_len, num_value_heads, V), dtype="float32"
+        )
+        g_buf = T.match_buffer(
+            g_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
         )
         beta_buf = T.match_buffer(
             beta_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
         )
-        # State: per value_head, K x V matrix in fp32
         state_in_buf = T.match_buffer(
             state_in_handle, (batch_size, num_value_heads, K, V), dtype="float32"
         )
-        # Outputs: out in fp32 for numerical stability (cast to model dtype by caller)
         out_buf = T.match_buffer(
             out_handle, (batch_size, seq_len, num_value_heads, V), dtype="float32"
         )
@@ -283,94 +280,79 @@ def create_gated_delta_net_func(
         for b_idx in T.thread_binding(batch_size, thread="blockIdx.y"):
             for h_idx in T.thread_binding(num_value_heads, thread="blockIdx.x"):
                 for col in T.thread_binding(V, thread="threadIdx.x"):
-                    kh = h_idx // heads_per_group
-
                     # Init state from state_in
                     for row in range(K):
                         with T.sblock("init_state"):
                             vb, vh, vr, vc = T.axis.remap("SSSS", [b_idx, h_idx, row, col])
                             state_out_buf[vb, vh, vr, vc] = state_in_buf[vb, vh, vr, vc]
 
-                    # Sequential loop over tokens (like RWKV6)
+                    # Sequential loop over tokens
                     for t in range(seq_len):
-                        # 1. Decay state: S = gate * S
-                        for row in range(K):
-                            with T.sblock("decay"):
-                                vb = T.axis.spatial(batch_size, b_idx)
-                                vt = T.axis.opaque(seq_len, t)
-                                vh = T.axis.spatial(num_value_heads, h_idx)
-                                vr = T.axis.opaque(K, row)
-                                vc = T.axis.spatial(V, col)
-                                state_out_buf[vb, vh, vr, vc] = (
-                                    state_out_buf[vb, vh, vr, vc] * gate_buf[vb, vt, vh]
+                        with T.sblock("compute"):
+                            vb = T.axis.spatial(batch_size, b_idx)
+                            vt = T.axis.opaque(seq_len, t)
+                            vh = T.axis.spatial(num_value_heads, h_idx)
+                            vj = T.axis.spatial(V, col)
+
+                            # NOTE: All intermediate accumulations use out_buf as
+                            # scratch space (not local vars) because Metal codegen
+                            # silently drops local-variable writes inside T.sblock.
+
+                            # 1. Decay state: S = exp(g) * S
+                            for i in range(K):
+                                state_out_buf[vb, vh, i, vj] = (
+                                    state_out_buf[vb, vh, i, vj]
+                                    * T.exp(g_buf[vb, vt, vh])
                                 )
 
-                        # 2. Compute dot(S[:, col], k[:]) → out_buf (fp32)
-                        with T.sblock("dot_sk_init"):
-                            vb = T.axis.spatial(batch_size, b_idx)
-                            vt = T.axis.opaque(seq_len, t)
-                            vh = T.axis.spatial(num_value_heads, h_idx)
-                            vc = T.axis.spatial(V, col)
-                            out_buf[vb, vt, vh, vc] = T.float32(0)
-
-                        for row in range(K):
-                            with T.sblock("dot_sk"):
-                                vb = T.axis.spatial(batch_size, b_idx)
-                                vt = T.axis.opaque(seq_len, t)
-                                vr = T.axis.opaque(K, row)
-                                vh = T.axis.spatial(num_value_heads, h_idx)
-                                vc = T.axis.spatial(V, col)
-                                out_buf[vb, vt, vh, vc] = out_buf[vb, vt, vh, vc] + state_out_buf[
-                                    vb, vh, vr, vc
-                                ] * T.cast(k_buf[vb, vt, kh, vr], "float32")
-
-                        # 3. Delta rule: S += k * beta * (v - dot_sk)
-                        for row in range(K):
-                            with T.sblock("delta"):
-                                vb = T.axis.spatial(batch_size, b_idx)
-                                vt = T.axis.opaque(seq_len, t)
-                                vr = T.axis.opaque(K, row)
-                                vh = T.axis.spatial(num_value_heads, h_idx)
-                                vc = T.axis.spatial(V, col)
-                                state_out_buf[vb, vh, vr, vc] = state_out_buf[
-                                    vb, vh, vr, vc
-                                ] + T.cast(k_buf[vb, vt, kh, vr], "float32") * beta_buf[
-                                    vb, vt, vh
-                                ] * (
-                                    T.cast(v_buf[vb, vt, vh, vc], "float32")
-                                    - out_buf[vb, vt, vh, vc]
+                            # 2. Read: kv_mem_j = sum_i S[i,j] * k_t[i]
+                            out_buf[vb, vt, vh, vj] = T.float32(0)
+                            for i in range(K):
+                                out_buf[vb, vt, vh, vj] += (
+                                    state_out_buf[vb, vh, i, vj]
+                                    * k_buf[vb, vt, vh, i]
                                 )
 
-                        # 4. Output: o[t, col] = dot(S_updated[:, col], q[t, :]) * scale
-                        with T.sblock("out_init"):
-                            vb = T.axis.spatial(batch_size, b_idx)
-                            vt = T.axis.opaque(seq_len, t)
-                            vh = T.axis.spatial(num_value_heads, h_idx)
-                            vc = T.axis.spatial(V, col)
-                            out_buf[vb, vt, vh, vc] = T.float32(0)
+                            # 3. Delta = (v_t[j] - kv_mem_j) * beta_t
+                            out_buf[vb, vt, vh, vj] = (
+                                v_buf[vb, vt, vh, vj] - out_buf[vb, vt, vh, vj]
+                            ) * beta_buf[vb, vt, vh]
 
-                        for row in range(K):
-                            with T.sblock("dot_sq"):
-                                vb = T.axis.spatial(batch_size, b_idx)
-                                vt = T.axis.opaque(seq_len, t)
-                                vr = T.axis.opaque(K, row)
-                                vh = T.axis.spatial(num_value_heads, h_idx)
-                                vc = T.axis.spatial(V, col)
-                                out_buf[vb, vt, vh, vc] = out_buf[vb, vt, vh, vc] + state_out_buf[
-                                    vb, vh, vr, vc
-                                ] * T.cast(q_buf[vb, vt, kh, vr], "float32")
+                            # 4. Rank-1 update: S[i,j] += k_t[i] * delta_j
+                            for i in range(K):
+                                state_out_buf[vb, vh, i, vj] += (
+                                    k_buf[vb, vt, vh, i]
+                                    * out_buf[vb, vt, vh, vj]
+                                )
 
-                        # 5. Apply scale
-                        with T.sblock("scale"):
-                            vb = T.axis.spatial(batch_size, b_idx)
-                            vt = T.axis.opaque(seq_len, t)
-                            vh = T.axis.spatial(num_value_heads, h_idx)
-                            vc = T.axis.spatial(V, col)
-                            out_buf[vb, vt, vh, vc] = out_buf[vb, vt, vh, vc] * T.float32(
-                                1.0 / math.sqrt(K)
-                            )
+                            # 5. Output: out[j] = sum_i S[i,j] * q_t[i]
+                            out_buf[vb, vt, vh, vj] = T.float32(0)
+                            for i in range(K):
+                                out_buf[vb, vt, vh, vj] += (
+                                    state_out_buf[vb, vh, i, vj]
+                                    * q_buf[vb, vt, vh, i]
+                                )
 
     return gdn_func
+
+
+def _stable_softplus(x: Tensor, threshold: float = 20.0) -> Tensor:
+    """Numerically stable softplus: log(1 + exp(x)).
+
+    For x > threshold, returns x directly (avoids exp overflow).
+    """
+
+    def _te_stable_softplus(x: te.Tensor):
+        return te.compute(
+            x.shape,
+            lambda *indices: tirx.if_then_else(
+                x[indices] > threshold,
+                x[indices],
+                tirx.log(1.0 + tirx.exp(x[indices])),
+            ),
+        )
+
+    return op.tensor_expr_op(_te_stable_softplus, "stable_softplus", [x])
 
 
 # ============================================================================
@@ -463,9 +445,27 @@ class Qwen35GatedDeltaNet(nn.Module):
         q = self._l2_normalize(q)
         k = self._l2_normalize(k)
 
-        # Gate computation
-        gate, beta = self._compute_gate_beta(alpha, beta_raw)
-        # beta is already (b, s, n_vh) — no GVA expansion needed.
+        # GQA expand Q, K from num_key_heads to num_value_heads
+        if n_vh != n_kh:
+            repeat_factor = n_vh // n_kh
+            q = op.repeat(q, repeat_factor, axis=2)
+            k = op.repeat(k, repeat_factor, axis=2)
+
+        # Pre-cast to float32 and pre-scale Q
+        scale = 1.0 / (K**0.5)
+        q_f32 = (q * scale).astype("float32")
+        k_f32 = k.astype("float32")
+        v_f32 = v.astype("float32")
+
+        # Compute log-space decay: g = -exp(A_log) * softplus(alpha + dt_bias)
+        a_float = alpha.astype("float32")
+        dt_bias_f32 = self.dt_bias.astype("float32")
+        a_plus_bias = a_float + op.reshape(dt_bias_f32, (1, 1, n_vh))
+        softplus_val = _stable_softplus(a_plus_bias)
+        neg_A = op.negative(op.exp(self.A_log.astype("float32")))
+        g = op.reshape(neg_A, (1, 1, n_vh)) * softplus_val
+
+        beta = op.sigmoid(beta_raw).astype("float32")
 
         # Get recurrent state from RNNState (state_id=0)
         state_in_layer = state.get(layer_idx, 0, (b, n_vh, K, V), "float32")
@@ -473,14 +473,12 @@ class Qwen35GatedDeltaNet(nn.Module):
         # Recurrent computation via TIR kernel
         out_recurrent, state_out_layer = op.tensor_ir_op(
             create_gated_delta_net_func(
-                num_key_heads=n_kh,
                 num_value_heads=n_vh,
                 key_head_dim=K,
                 value_head_dim=V,
-                dtype=self.dtype,
             ),
             "gated_delta_net",
-            [q, k, v, gate, beta, state_in_layer],
+            [q_f32, k_f32, v_f32, g, beta, state_in_layer],
             [
                 Tensor.placeholder([b, s, n_vh, V], "float32"),
                 Tensor.placeholder([b, n_vh, K, V], "float32"),
@@ -558,47 +556,15 @@ class Qwen35GatedDeltaNet(nn.Module):
         inv_norm = op.sqrt(sum_sq + 1e-6)
         return op.astype(x_f32 / inv_norm, self.dtype)
 
-    def _compute_gate_beta(self, alpha: Tensor, beta_raw: Tensor):
-        """Compute decay gate and update rate.
-
-        gate = exp(-exp(A_log) * softplus(alpha + dt_bias))  (per value_head)
-        beta = sigmoid(beta_raw)  (per value_head)
-        """
-
-        # alpha: (b, s, n_vh), dt_bias: (n_vh,), A_log: (n_vh,)
-        def _te_gate(alpha: te.Tensor, A_log: te.Tensor, dt_bias: te.Tensor):
-            b, s, h = alpha.shape
-
-            def _softplus(x):
-                # softplus(x) = x if x > 20 else log(1 + exp(x))
-                return tirx.if_then_else(x > 20.0, x, tirx.log(1.0 + tirx.exp(x)))
-
-            return te.compute(
-                (b, s, h),
-                lambda bi, si, hi: tirx.exp(
-                    -tirx.exp(A_log[hi].astype("float32"))
-                    * _softplus((alpha[bi, si, hi] + dt_bias[hi]).astype("float32"))
-                ),
-                name="gate",
-            )
-
-        gate = op.tensor_expr_op(
-            _te_gate,
-            "gate",
-            [alpha, self.A_log, self.dt_bias],
-            attrs={"op_pattern": 8},
-        )
-
-        beta = op.sigmoid(beta_raw).astype("float32")
-        return gate, beta
-
     def to(self, dtype: Optional[str] = None):
         super().to(dtype=dtype)
         if dtype is not None:
             self.dtype = dtype
-        # A_log and dt_bias must stay float32
-        self.A_log.to("float32")
-        self.dt_bias.to("float32")
+        # NOTE: Do NOT override A_log/dt_bias to float32 here.
+        # The weight converter stores all params as bfloat16 (f32-to-bf16 format).
+        # If these params are declared float32 at compile time but stored as bf16,
+        # the runtime misinterprets the bf16 bytes as fp16, corrupting the values.
+        # Instead, keep them in model dtype and cast to float32 at computation time.
 
 
 # ============================================================================
